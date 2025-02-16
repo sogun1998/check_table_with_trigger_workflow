@@ -1,0 +1,108 @@
+---
+  name: check-missing-updated-at-trigger
+  on:
+    push:
+      branches:
+        - main
+    workflow_dispatch:
+  
+  jobs:
+    check-missing-updated-at-trigger:
+      runs-on: ubuntu-latest
+      permissions:
+        contents: read 
+      services:
+        postgres:
+          image: postgres:13
+          ports:
+            - 5432:5432
+          env:
+            POSTGRES_USER: user
+            POSTGRES_PASSWORD: password
+            POSTGRES_DB: mydatabase
+      steps:
+        - uses: actions/checkout@v4
+  
+        - name: Wait for PostgreSQL to start
+          run: |
+            for i in {1..30}; do
+              if pg_isready -h localhost -p 5432 -U user; then
+                echo "PostgreSQL is ready"
+                break
+              else
+                echo "Waiting for PostgreSQL..."
+                sleep 1
+              fi
+            done
+  
+        - name: Create init.sql with tables, trigger function, and validation function
+          run: |
+            cat <<-'EOF' > init.sql
+            -- Tạo function set_updated_at()
+            CREATE OR REPLACE FUNCTION set_updated_at()
+            RETURNS TRIGGER AS $$
+            BEGIN
+              IF TG_OP = 'UPDATE' THEN
+                NEW.updated_at = NOW();
+              END IF;
+              RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+  
+            -- Tạo bảng test có trigger
+            CREATE TABLE test_table_with_trigger (
+              id SERIAL PRIMARY KEY,
+              name VARCHAR(100),
+              updated_at TIMESTAMP DEFAULT NOW()
+            );
+  
+            CREATE TRIGGER update_updated_at_test_table_with_trigger
+            BEFORE UPDATE ON test_table_with_trigger
+            FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+  
+            -- Function kiểm tra bảng nào thiếu trigger set_updated_at
+            CREATE OR REPLACE FUNCTION check_missing_updated_at_trigger()
+            RETURNS TABLE(missing_table TEXT) AS $$
+            BEGIN
+                RETURN QUERY
+                SELECT CAST(tbl.relname AS TEXT)
+                FROM pg_class tbl
+                JOIN pg_namespace ns ON tbl.relnamespace = ns.oid
+                WHERE ns.nspname = 'public'
+                AND EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                    AND table_name = tbl.relname
+                    AND column_name = 'updated_at'
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM pg_trigger trg2
+                    JOIN pg_proc p2 ON trg2.tgfoid = p2.oid
+                    WHERE trg2.tgrelid = tbl.oid
+                    AND p2.proname = 'set_updated_at'
+                )
+                AND EXISTS (
+                    SELECT 1 FROM pg_stat_all_tables stat
+                    WHERE stat.relname = tbl.relname
+                );
+            END;
+            $$ LANGUAGE plpgsql;
+            EOF
+  
+        - name: Apply init.sql to PostgreSQL
+          run: |
+            PGPASSWORD=password psql -h localhost -U user -d mydatabase -f init.sql
+  
+        - name: Check for Missing Triggers
+          run: |
+            set -e
+            MISSING_TABLES=$(PGPASSWORD=password psql -U user -d mydatabase -h localhost -p 5432 -t -A -c "SELECT missing_table FROM check_missing_updated_at_trigger();")
+            
+            if [[ -n "$MISSING_TABLES" ]]; then
+              echo "❌ Một số bảng thiếu trigger set_updated_at:"
+              echo "$MISSING_TABLES"
+              exit 1
+            else
+              echo "✅ Tất cả các bảng đều có trigger set_updated_at."
+            fi
+  
